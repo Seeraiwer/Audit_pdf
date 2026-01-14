@@ -19,6 +19,12 @@ die() { echo "Erreur: $*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 can_sudo() { command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; }
 
+ensure_home_bin_in_path() {
+  if [[ -d "$HOME/bin" ]]; then
+    export PATH="$HOME/bin:$PATH"
+  fi
+}
+
 detect_pkg_mgr() {
   if need_cmd yay; then echo "yay"; return; fi
   if need_cmd pacman; then echo "pacman"; return; fi
@@ -34,10 +40,22 @@ install_sys_pkgs() {
   local pkgs=("$@")
   case "$mgr" in
     yay)    yay -S --needed --noconfirm "${pkgs[@]}" ;;
-    pacman) sudo pacman -Sy --noconfirm "${pkgs[@]}" ;;
-    apt)    sudo apt-get update -y && sudo apt-get install -y "${pkgs[@]}" ;;
-    dnf)    sudo dnf check-update -y || true && sudo dnf install -y "${pkgs[@]}" ;;
-    yum)    sudo yum check-update -y || true && sudo yum install -y "${pkgs[@]}" ;;
+    pacman)
+      can_sudo || die "sudo requis pour pacman. Relance en root ou active sudo."
+      sudo pacman -Sy --noconfirm "${pkgs[@]}"
+      ;;
+    apt)
+      can_sudo || die "sudo requis pour apt. Relance en root ou active sudo."
+      sudo apt-get update -y && sudo apt-get install -y "${pkgs[@]}"
+      ;;
+    dnf)
+      can_sudo || die "sudo requis pour dnf. Relance en root ou active sudo."
+      sudo dnf check-update -y || true && sudo dnf install -y "${pkgs[@]}"
+      ;;
+    yum)
+      can_sudo || die "sudo requis pour yum. Relance en root ou active sudo."
+      sudo yum check-update -y || true && sudo yum install -y "${pkgs[@]}"
+      ;;
     brew)   brew update || true && brew install "${pkgs[@]}" ;;
     *)      die "Aucun gestionnaire de paquets compatible détecté (installe manuellement : ${pkgs[*]})." ;;
   esac
@@ -49,9 +67,14 @@ ensure_tool() {
   if ! need_cmd "$name"; then
     log "Téléchargement $name"
     mkdir -p "$HOME/bin"
-    curl -fL --retry 3 --retry-delay 1 "$url" -o "$HOME/bin/$name"
+    curl -fL --retry 3 --retry-delay 1 "$url" -o "$HOME/bin/${name}.py"
+    chmod +x "$HOME/bin/${name}.py"
+    cat > "$HOME/bin/$name" <<EOF
+#!/usr/bin/env bash
+exec python3 "\$HOME/bin/${name}.py" "\$@"
+EOF
     chmod +x "$HOME/bin/$name"
-    export PATH="$HOME/bin:$PATH"
+    ensure_home_bin_in_path
     hash -r
     need_cmd "$name" || die "$name introuvable après installation."
   fi
@@ -91,6 +114,8 @@ FILE="${1:-}"
 [[ -n "${FILE}" ]] || die "Usage: $0 /chemin/vers/fichier.pdf"
 [[ -f "${FILE}" ]] || die "Fichier introuvable: $FILE"
 
+ensure_home_bin_in_path
+
 log "Analyse de: ${FILE}"
 
 SIZE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE")
@@ -100,15 +125,24 @@ SIZE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE")
 PKG_MGR=$(detect_pkg_mgr)
 log "Gestionnaire de paquets: ${PKG_MGR}"
 
-# Paquets de base (Arch: yay/pacman; autres: apt/dnf/yum/brew)
-SYS_PKGS=(clamav exiftool python python-pip curl)
+# Paquets de base (dépendants du gestionnaire)
+case "$PKG_MGR" in
+  yay|pacman) SYS_PKGS=(clamav exiftool python python-pip curl) ;;
+  apt|dnf|yum) SYS_PKGS=(clamav exiftool python3 python3-pip curl) ;;
+  brew) SYS_PKGS=(clamav exiftool python curl) ;;
+  *) SYS_PKGS=() ;;
+esac
 MISSING=()
-for c in clamscan exiftool python3 python curl; do
+for c in clamscan exiftool python3 curl; do
   need_cmd "$c" || MISSING+=("$c")
 done
 if ((${#MISSING[@]})); then
-  log "Installation des dépendances système manquantes: ${SYS_PKGS[*]}"
-  install_sys_pkgs "$PKG_MGR" "${SYS_PKGS[@]}"
+  if ((${#SYS_PKGS[@]})); then
+    log "Installation des dépendances système manquantes: ${SYS_PKGS[*]}"
+    install_sys_pkgs "$PKG_MGR" "${SYS_PKGS[@]}"
+  else
+    die "Gestionnaire de paquets inconnu. Installe manuellement: ${MISSING[*]}"
+  fi
 fi
 
 # ===== Outils PDF (téléchargements directs) =====
@@ -137,11 +171,11 @@ get_marker_count() { awk -v m="$1" '$1==m {print $2}' "$PDFID_OUT" | tr -d '()' 
 
 declare -A MARKER_COUNTS=()
 for m in "${SUSPICIOUS_MARKERS[@]}"; do
-  MARKER_COUNTS["$m"]="$(num_or_zero "$(get_marker_count "$m")")"
+  MARKER_COUNTS["$m"]="$(num_or_zero "$(get_marker_count "$m" | awk '{sum+=$1} END {print sum+0}')")"
 done
 declare -A WATCH_COUNTS=()
 for m in "${WATCH_MARKERS[@]}"; do
-  WATCH_COUNTS["$m"]="$(num_or_zero "$(get_marker_count "$m")")"
+  WATCH_COUNTS["$m"]="$(num_or_zero "$(get_marker_count "$m" | awk '{sum+=$1} END {print sum+0}')")"
 done
 
 # 2) pdf-parser
@@ -180,8 +214,10 @@ PAGECOUNT=$(grep -E "^Page Count *:" "$EXIF_OUT" | awk -F': ' '{print $2}' | xar
 VT_POSITIVES=""; VT_TOTAL=""
 if [[ -n "${VT_API_KEY:-}" ]]; then
   log "VirusTotal: lookup par hash via API…"
-  VT_JSON="$(curl -sS --retry 3 --retry-delay 1 -H "x-apikey: ${VT_API_KEY}" "${VT_API_URL}/${SHA256_VAL}" || true)"
-  if [[ -n "$VT_JSON" ]]; then
+  VT_JSON_FILE="$TMPDIR/vt.json"
+  VT_HTTP="$(curl -sS --retry 3 --retry-delay 1 -H "x-apikey: ${VT_API_KEY}" -o "$VT_JSON_FILE" -w "%{http_code}" "${VT_API_URL}/${SHA256_VAL}" || true)"
+  if [[ "$VT_HTTP" == "200" ]]; then
+    VT_JSON="$(cat "$VT_JSON_FILE")"
     VT_POSITIVES="$(
       VT_JSON="$VT_JSON" python3 - <<'PY'
 import os, json
@@ -204,6 +240,10 @@ except Exception:
     print("")
 PY
     )"
+  elif [[ "$VT_HTTP" == "404" ]]; then
+    log "VirusTotal: hash inconnu (404)."
+  elif [[ -n "$VT_HTTP" ]]; then
+    log "VirusTotal: erreur HTTP ${VT_HTTP}."
   fi
 fi
 
